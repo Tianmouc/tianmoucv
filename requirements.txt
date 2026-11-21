@@ -1,8 +1,9 @@
 # Base ----------------------------------------
 charset-normalizer>=3.1.0
 matplotlib>=3.2.2
-# NVIDIA/Jetson PyTorch wheels in the supported range use the NumPy 1.x ABI.
-numpy>=1.18.5,<2
+# Keep NumPy 1.x on ARM64 for compatibility with older NVIDIA/Jetson PyTorch wheels.
+numpy>=1.18.5,<2; platform_machine == "aarch64" or platform_machine == "arm64"
+numpy>=1.18.5; platform_machine != "aarch64" and platform_machine != "arm64"
 # OpenCV 4.12+ requires NumPy 2 on Python 3.9+, which is incompatible with
 # supported NVIDIA/Jetson PyTorch wheels built against the NumPy 1.x ABI.
 opencv-python>=4.1.1,<4.12
