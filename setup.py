@@ -1,7 +1,23 @@
 import os
-import subprocess
-from setuptools import setup, find_packages
-from setuptools.command.install import install
+import shutil
+from pathlib import Path
+
+from pybind11.setup_helpers import Pybind11Extension, build_ext
+from setuptools import find_packages, setup
+
+
+class DecoderBuild(build_ext):
+    def build_extension(self, ext):
+        # update.sh can reuse a decoder built for this interpreter.
+        destination = Path(self.get_ext_fullpath(ext.name))
+        cached = Path(__file__).resolve().parent.joinpath(*ext.name.split(".")[:-1], destination.name)
+        if "ONLY_UPDATE_PYTHON" in os.environ and cached.is_file():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if cached.resolve() != destination.resolve():
+                shutil.copy2(cached, destination)
+        else:
+            super().build_extension(ext)
+
 
 with open("./requirements.txt", "r", encoding="utf-8") as fh:
     install_requires = fh.read()
@@ -10,31 +26,6 @@ with open("./requirements.txt", "r", encoding="utf-8") as fh:
 long_description = "See README: https://github.com/Tianmouc/tianmoucv/blob/main/README.md"
 
 
-'''
-major.minor.patch.
-主版本：当出现不兼容的 API 变动时，版本号会递增。
-小版本：在以向后兼容的方式添加功能时递增。
-PATCH 版本：在进行向后兼容的错误修复时递增。
-'''
-try:
-    if "ONLY_UPDATE_PYTHON" not in os.environ:
-        print("WARNING: no decoder found, try to auto compile")
-        print('If you still get this message,please try:\n 1. run it in a python script (only once) \n 2. installfrom source code (install.sh) to see what happened')
-        current_file_path = os.path.dirname(os.path.abspath(__file__))
-        aim_path = os.path.join(current_file_path,'tianmoucv','rdp_usb')
-        os.chdir(aim_path)
-        current_path = os.getcwd()
-        print("Current Path:", current_path)
-        subprocess.run(['sh', './compile_pybind.sh'])
-        aim_path = os.path.join(current_file_path,'tianmoucv','rdp_pcie')
-        os.chdir(aim_path)
-        current_path = os.getcwd()
-        print("Current Path:", current_path)
-        subprocess.run(['sh', './compile_pybind.sh'])
-        print('compile decoder successfully!')
-except:
-    print('[FATAL ERROR]: Fail to compile rdp pakage, please use ./install.sh to install tianmoucv')
-
 setup(
     name='tianmoucv',                     # 模块的名称
     version='0.4.3.2',                # 版本号 #带.1的是pub版本
@@ -42,6 +33,14 @@ setup(
     author_email='532109881@qq.com',      # 作者邮箱
     description='Algorithms library for Tianmouc sensor',   # 简要描述
     url='https://github.com/Tianmouc/tianmoucv_dev',  # 项目主页的URL
+    ext_modules=[
+        Pybind11Extension(f"tianmoucv.{decoder}.rod_decoder_py",
+                          [f"tianmoucv/{decoder}/rod_decoder_py.cpp"], cxx_std=17)
+        for decoder in ("rdp_usb", "rdp_pcie")
+    ],
+    cmdclass={"build_ext": DecoderBuild},
+    exclude_package_data={"": ["rod_decoder_py*.so", "rod_decoder_py*.pyd",
+                               "rdp_*/rod_decoder_py*.so", "rdp_*/rod_decoder_py*.pyd"]},
     packages=find_packages(),   # 告诉 setuptools 自动找到要安装的包
     package_data = {'':['rdp_pcie/*',
                         'rdp_usb/*',

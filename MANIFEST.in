@@ -1,0 +1,2 @@
+include requirements.txt
+global-exclude rod_decoder_py*.so rod_decoder_py*.pyd
