@@ -3,6 +3,9 @@ import cv2
 import scipy.sparse.linalg as sparse_la
 from scipy import sparse
 import torch
+import torch.nn.functional as F
+
+from .sd_poisson import poisson_gray
 
 def get_laplacian(Ix,Iy):
     result = np.zeros_like(Ix)
@@ -166,41 +169,43 @@ def genMask(gray,th = 24, maxV=255, minV = 0):
 
 
 def poisson_blending(Ix,Iy,srcimg=None, iteration=20, mask_rgb=False, mask_th = 24, smooth=True):
-    '''
-    RGB/灰度 HDR 融合重建
+    """Reconstruct relative grayscale, or fuse SD detail with a reference image.
 
-    vectorized by Y. Lin
-    Function to apply Poisson blending to two images
-    :Ix,Iy: [h,w]，x和y方向的梯度
-    :sciimg: [None],[h,w],[h,w,3]，分别进入不同模式
-    '''
-    if mask_rgb and not srcimg is None:
-        mask = genMask(srcimg, th = mask_th, maxV=255, minV = 0)
-    result = None
-    
+    Ix and Iy are signed forward gradients on their input grid. For raw SDL
+    and SDR, use sd_gradients first. With srcimg, use gradients in the same
+    intensity units as the source. Exposure masking expects RGB in [0, 1].
+    The iteration argument is retained for callers of the former solver.
+    """
+    gray = poisson_gray(Ix, Iy)
     if srcimg is None:
-        result = laplacian_blending_1c(Ix,Iy,gray=srcimg,iteration=iteration)
-    elif len(srcimg.shape)==2:
-        img = srcimg.clone()
-        result = laplacian_blending_1c(Ix,Iy,img,iteration=iteration)
-    elif len(srcimg.shape)==3:
-        img = srcimg.clone()
-        for c in range(img.shape[-1]):
-            target = img[...,c]
-            img[...,c] = laplacian_blending_1c(Ix,Iy,target,iteration=iteration)
-        result = img
-    else:
-        print('img shape:',srcimg.shape,' is illegal, [None],[H,W],[H,W,C] is supported')
-
-    if mask_rgb and not result is None:
-        if smooth:
-            mask /= 255.0
-            result = (1-mask) * result + mask * srcimg
-        else:
-            mask = mask>0.5
-            mask = mask.bool()
-            result[mask] = srcimg[mask]
-
+        return gray
+    source = torch.as_tensor(srcimg, device=gray.device, dtype=gray.dtype)
+    if source.ndim not in (2, 3):
+        raise ValueError("srcimg must be [H,W] or [H,W,C]")
+    gray = F.interpolate(gray[None, None], size=source.shape[:2], mode="bilinear",
+                         align_corners=False)[0, 0]
+    if source.ndim == 3:
+        gray = gray[..., None]
+    # Gradients do not determine brightness or chroma. Anchor the local mean
+    # of each channel to the COP while retaining SD detail within the window.
+    difference = source - gray
+    anchor = difference
+    for axis in (0, 1):
+        length = anchor.shape[axis]
+        centers = torch.arange(length, device=anchor.device)
+        lo = (centers - 16).clamp_min(0)
+        hi = (centers + 17).clamp_max(length)
+        # A prefix sum evaluates the clipped 33-pixel window in linear time.
+        prefix = torch.cat((torch.zeros_like(anchor.narrow(axis, 0, 1)),
+                            anchor.cumsum(axis)), dim=axis)
+        shape = [1] * anchor.ndim
+        shape[axis] = length
+        anchor = (prefix.index_select(axis, hi) - prefix.index_select(axis, lo)) / (hi - lo).view(shape)
+    result = gray + anchor
+    if mask_rgb:
+        mask = genMask(source, th=mask_th).to(source.dtype)
+        keep = mask / 255 if smooth else (mask > 0.5).to(source.dtype)
+        result = torch.lerp(result, source, keep)
     return result
 
 print_warning = True

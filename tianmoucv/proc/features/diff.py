@@ -1,376 +1,231 @@
-# author: yihan lin
-import cv2
-import sys
-import numpy as np
-from PIL import Image
-
-import torch
-import torch.nn.functional as F
-import torch.nn as nn
-
 import math
 
-#===============================================================
-# sobel
-# ===============================================================
+import numpy as np
+import torch
+import torch.nn.functional as F
+from scipy.spatial import cKDTree
+
+
+def _gradients(Ix, Iy):
+    grad_x = torch.as_tensor(Ix)
+    grad_y = torch.as_tensor(Iy, device=grad_x.device)
+    if grad_x.ndim != 2 or grad_x.shape != grad_y.shape:
+        raise ValueError("Ix and Iy must be two-dimensional gradients of equal shape")
+    if not grad_x.is_floating_point():
+        grad_x = grad_x.float()
+    grad_y = grad_y.to(dtype=grad_x.dtype)
+    return grad_x, grad_y
+
+
 def sobel_operator(Ix, Iy):
-    # 计算梯度幅值
-    magnitude = torch.sqrt(torch.pow(Ix, 2) + torch.pow(Iy, 2))
-    # 计算梯度角度
-    angle = torch.atan2(Iy, Ix)
-    return magnitude, angle
+    grad_x, grad_y = _gradients(Ix, Iy)
+    return torch.hypot(grad_x, grad_y), torch.atan2(grad_y, grad_x)
 
 
-# ===============================================================
-# 高斯卷积核
-# ===============================================================
-def gaussain_kernel(size=5,sigma=2):
-    '''
-    generate Gaussain blur kernel
-    
-    parameter:
-        :param size: 特征的数量，int
-        :param sigma: 高斯标准差，int
-
-    '''
+def gaussain_kernel(size=5, sigma=2, device=None, dtype=None):
     size = int(size)
+    if size < 1 or sigma <= 0:
+        raise ValueError("size and sigma must be positive")
     if size % 2 == 0:
-        size = size + 1
-    m = (size - 1) / 2
-    y, x = torch.meshgrid(torch.arange(-m, m + 1), torch.arange(-m, m + 1))
-    kernel = torch.exp(-(x * x + y * y) / (2 * sigma * sigma))
-    kernel = kernel / torch.sum(kernel)
-    kernel = kernel.unsqueeze(0).unsqueeze(0)
-    return kernel
+        size += 1
+    coordinates = torch.arange(size, device=device, dtype=dtype or torch.float32) - size // 2
+    grid_y, grid_x = torch.meshgrid(coordinates, coordinates, indexing="ij")
+    kernel = torch.exp(-(grid_x.square() + grid_y.square()) / (2 * sigma * sigma))
+    return (kernel / kernel.sum()).unsqueeze(0).unsqueeze(0)
 
 
-# ===============================================================
-# 用现有高斯核做高斯模糊
-# ===============================================================
 def gaussian_smooth(inputTensor: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
-    '''
-    用现有高斯核做高斯模糊
-    
-    parameter:
-        :param inputTensor: 待处理矩阵,torch.Tensor
-        :param kernel: 高斯模糊核,torch.Tensor
-        :return: 处理后同尺寸模糊图,torch.Tensor
-
-    '''
-    padding_size = kernel.shape[-1] // 2
-    input_padded = F.pad(inputTensor, (padding_size, padding_size, padding_size, padding_size), mode='reflect')
-    kernel = kernel.to(inputTensor.device)
-    return F.conv2d(input_padded, kernel, stride=1, padding=0)
+    if inputTensor.ndim != 4:
+        raise ValueError("inputTensor must have shape [batch, channels, height, width]")
+    if not inputTensor.is_floating_point():
+        inputTensor = inputTensor.float()
+    kernel = kernel.to(device=inputTensor.device, dtype=inputTensor.dtype)
+    padding = kernel.shape[-1] // 2
+    padding_mode = "reflect" if min(inputTensor.shape[-2:]) > padding else "replicate"
+    padded = F.pad(inputTensor, (padding, padding, padding, padding), mode=padding_mode)
+    channels = inputTensor.shape[1]
+    return F.conv2d(padded, kernel.expand(channels, 1, -1, -1), groups=channels)
 
 
-
-# ===============================================================
-# Harris角点，用Ix和Iy做计算，可以用SD的两个方向
-# ===============================================================
-def HarrisCorner(Ix:torch.Tensor,Iy:torch.Tensor, thresh = 0.1,k = 0.1,size=5,sigma=1,nmsSize=11):
-    '''
-    Harris 角点检测
-    
-    .. math:: R=det(H)−ktrace(H) 
-    .. math:: \lambda1 + \lambda2 = \sum I_x^2 * \sum I_y^2 - \sum I_{xy} ^ 2
-    .. math:: \lambda1 * \lambda2 = \sum I_{xy} ^ 2
-    .. math:: R = det H - k trace H ^2= \lambda_1*\lambda_2 - k(\lambda_1 + \lambda_2)^ 2
-    .. math::   = (\sum I_{X^2} * \sum I_{y^2} - \sum I_{xy} ^ 2) - k (\sum I_x^2 + \sum I_y^2)^2
-    
-    parameter:
-        :param Ix: x方向梯度,[h,w],torch.Tensor
-        :param Iy: y方向梯度,[h,w],torch.Tensor
-        :param size: 高斯核尺寸,int
-        :param th: 控制阈值,范围是0-1,对梯度来说应该设小一点,float
-        :param nmsSize: 最大值筛选的范围
-        :param k: 是一个经验参数,0-1,float
-
-    '''
-    # 1. sober filtering
-    Ix2 = Ix ** 2
-    Iy2 = Iy ** 2
-    Ixy = Ix * Iy
-    # 3. corner detect
-    kernel = gaussain_kernel(size,sigma)
-    Ix2 = gaussian_smooth(Ix2.unsqueeze(0).unsqueeze(0), kernel).squeeze(0).squeeze(0)
-    Iy2 = gaussian_smooth(Iy2.unsqueeze(0).unsqueeze(0), kernel).squeeze(0).squeeze(0)
-    Ixy = gaussian_smooth(Ixy.unsqueeze(0).unsqueeze(0), kernel).squeeze(0).squeeze(0)
-
-    R = (Ix2 * Iy2 - Ixy ** 2) - k * ((Ix2 + Iy2) ** 2)
-    
-    corner_list = []
-    for i in range(R.shape[0]):
-        for j in range(R.shape[1]):
-            if R[i,j] > thresh:
-                i_min = max(i-nmsSize//2,0)
-                i_max = min(i+nmsSize//2,R.shape[0]-1)
-                j_min = max(j-nmsSize//2,0)
-                j_max = min(j+nmsSize//2,R.shape[1]-1)
-                neibor = R[i_min:i_max,j_min:j_max]
-                if R[i,j] >= torch.max(neibor)-1e-5:
-                    corner_list.append((i,j))
-
-    print('[tianmoucv.HarrisCorner]detect ', len(corner_list),' corner points')
-    return corner_list
-
-    
-# ===============================================================
-# Shi-Tomasi角点，用Ix和Iy做计算，可以用SD的两个方向
-# ===============================================================
-def TomasiCorner(Ix:torch.Tensor, Iy:torch.Tensor, index=1000,size=5,sigma=2,nmsSize=11):
-    '''
-    Shi-Tomasi 角点检测
-    在Harris角点检测的基础上，Shi和Tomasi 在1993的一篇论文《Good Features to track》中提出了基于Harris角点检测的Shi-Tomasi方法。
-    经验参数需求更少，更快，但效果变差
-    
-    parameter:
-        :param Ix: x方向梯度,[h,w],torch.Tensor
-        :param Iy: y方向梯度,[h,w],torch.Tensor
-        :param size: 高斯核尺寸,int
-        :param index: 前N个点,int
-        :param nmsSize: 最大值筛选的范围
-
-    '''
-    # 1. get difference image
-    Ix[Ix<torch.max(Ix)*0.1]=0
-    Iy[Iy<torch.max(Iy)*0.1]=0
-    # 2. sober filtering
-    Ix2 = Ix ** 2
-    Iy2 = Iy ** 2
-    Ixy = Ix * Iy
-    # 3. windowed
-    kernel = gaussain_kernel(size,sigma)
-    Ix2 = gaussian_smooth(Ix2.unsqueeze(0).unsqueeze(0), kernel).squeeze(0).squeeze(0)
-    Iy2 = gaussian_smooth(Iy2.unsqueeze(0).unsqueeze(0), kernel).squeeze(0).squeeze(0)
-    Ixy = gaussian_smooth(Ixy.unsqueeze(0).unsqueeze(0), kernel).squeeze(0).squeeze(0)
-    # prepare output image
-    out = np.zeros(Ix2.shape)
-    # get R
-    K = Ix2**2 + Iy2 **2 + Iy2*Ix2 + Ixy**2 + 1e-16
-    R = Ix2 + Iy2 - torch.sqrt(K)
-    # detect corner
-    
-    sorted_, _ = torch.sort(R.view(1,-1), descending=True)#descending为False，升序，为True，降序
-    threshold = sorted_[0,index]
-    
-    corner_list = []
-    for i in range(R.shape[0]):
-        for j in range(R.shape[1]):
-            if R[i,j] > th:
-                i_min = max(i-nmsSize//2,0)
-                i_max = min(i+nmsSize//2,R.shape[0]-1)
-                j_min = max(j-nmsSize//2,0)
-                j_max = min(j+nmsSize//2,R.shape[1]-1)
-                neibor = R[i_min:i_max,j_min:j_max]
-                if R[i,j] >= torch.max(neibor)-1e-5:
-                    corner_list.append((i,j))
-    return corner_list
-
-#===============================================================
-# ******HOG****** 
-# ===============================================================
-
-def hog(Ix:torch.Tensor,Iy:torch.Tensor,kplist:list):
-    '''
-    hog 特征描述
-    
-    parameter:
-        :param Ix: x方向梯度,[h,w],torch.Tensor
-        :param Iy: y方向梯度,[h,w],torch.Tensor
-        :param kplist: list of [x,y] 需要hog的坐标list, list
-
-    '''
-    cell_size = (8, 8)  # 单元格大小
-    num_bins = 9  # 直方图通道数
-    gradient_directions = np.arctan2(Ix, Iy)  # 梯度方向
-    gradient_magnitude = np.sqrt(Ix**2 + Iy**2)  # 梯度幅度
-    num_cells_x = int(Ix.shape[1] / cell_size[1])
-    num_cells_y = int(Ix.shape[0] / cell_size[0])
-    histograms = np.zeros((num_cells_y, num_cells_x, num_bins))
-
-    discriptorList = []
-    goodkp = []
-    for kp in kplist:
-        y , x = int(kp[0]), int(kp[1])
-
-        cell_magnitude = gradient_magnitude[y-cell_size[0]:y+cell_size[0], x-cell_size[1]:x+cell_size[1]]
-        cell_direction = gradient_directions[y-cell_size[0]:y+cell_size[0], x-cell_size[1]:x+cell_size[1]]
-        histogram = torch.zeros(num_bins)
-        if cell_magnitude.shape[0] < cell_size[0]*2 or cell_magnitude.shape[1] < cell_size[1]*2 :
-            continue
-            
-        for i in range(cell_size[0]):
-            for j in range(cell_size[1]):
-                direction = cell_direction[i, j]
-                magnitude = cell_magnitude[i, j]
-                bin_index = int(num_bins * direction / (2 * math.pi))
-                histogram[bin_index] += magnitude
-        discriptorList.append(histogram)
-        goodkp.append(kp)
-    return goodkp,discriptorList
+def _second_moments(grad_x, grad_y, size, sigma):
+    kernel = gaussain_kernel(size, sigma, device=grad_x.device, dtype=grad_x.dtype)
+    products = torch.stack((grad_x.square(), grad_y.square(), grad_x * grad_y), dim=0)
+    smoothed = gaussian_smooth(products.unsqueeze(0), kernel).squeeze(0)
+    return smoothed[0], smoothed[1], smoothed[2]
 
 
-#===============================================================
-# ******steadyHarrisCornerForSIFT****** 
-# ===============================================================
-
-def steadyHarrisCornerForSIFT(Ix:torch.Tensor,Iy:torch.Tensor,num_levels = 6, thresh = 0.1,k = 0.1,size=5,sigma=1,nmsSize=11):
-        
-    corner_list_pyramid = []
-    current_shape = Ix.shape
-
-    for i in range(num_levels):
-
-        corner_list = HarrisCorner(Ix, Iy, thresh = thresh, k = k, size=size, sigma=sigma, nmsSize=nmsSize)
-
-        corner_list = [(kp[0],kp[1]) for kp in corner_list]
-
-        corner_list_pyramid.append(corner_list)
-        
-        if current_shape[0] > 1 or current_shape[1] > 1:
-            # Use the 'valid' option to prevent zero-padding
-            Ix = F.interpolate(Ix.unsqueeze(0).unsqueeze(0), 
-                               size=(current_shape[1] // 2, current_shape[0] // 2), mode='bilinear').squeeze(0).squeeze(0)
-            Iy = F.interpolate(Iy.unsqueeze(0).unsqueeze(0), 
-                               size=(current_shape[1] // 2, current_shape[0] // 2), mode='bilinear').squeeze(0).squeeze(0)
-            current_shape = Ix.shape
-
-    final_corner_list = []
-    for i in range(num_levels):
-        current_corner_list = corner_list_pyramid[i]
-        neibor_list = []
-        if i > 0:
-            neibor_list += corner_list_pyramid[i-1]
-            for kp in current_corner_list:
-                for kp_match in neibor_list:
-                    if (kp[0]-kp_match[0])**2 + (kp[1]-kp_match[1])**2 < 4:
-                        final_corner_list.append((kp[1],kp[0],i+1))
-        if i < num_levels-1:
-            neibor_list += corner_list_pyramid[i+1]
-            for kp in current_corner_list:
-                for kp_match in neibor_list:
-                    if (kp[0]-kp_match[0])**2 + (kp[1]-kp_match[1])**2 < 4:
-                        final_corner_list.append((kp[1],kp[0],i+1))
-       
-    print('[tianmoucv.steadyHarrisCornerForSIFT]Steady KP for SIFT:',len(final_corner_list))
-
-    return final_corner_list
+def _corner_peaks(response, nms_size, threshold=0, maximum=None):
+    if nms_size < 1 or nms_size % 2 == 0:
+        raise ValueError("nmsSize must be a positive odd integer")
+    if maximum == 0:
+        return []
+    pooled = F.max_pool2d(response[None, None], nms_size, stride=1, padding=nms_size // 2)[0, 0]
+    peak_mask = (response > threshold) & (response == pooled)
+    coordinates = torch.nonzero(peak_mask)
+    if maximum is not None and coordinates.shape[0] > maximum:
+        strengths = response[coordinates[:, 0], coordinates[:, 1]]
+        coordinates = coordinates[torch.topk(strengths, maximum).indices]
+    return [tuple(point) for point in coordinates.cpu().tolist()]
 
 
-#===============================================================
-# ******SIFT****** 
-# ===============================================================
+def HarrisCorner(Ix: torch.Tensor, Iy: torch.Tensor, thresh=0.1, k=0.1,
+                 size=5, sigma=1, nmsSize=11):
+    """Return (row, column) Harris corners; thresh is relative to the positive peak."""
+    if not 0 <= thresh <= 1:
+        raise ValueError("thresh must be between 0 and 1")
+    grad_x, grad_y = _gradients(Ix, Iy)
+    moment_xx, moment_yy, moment_xy = _second_moments(grad_x, grad_y, size, sigma)
+    trace = moment_xx + moment_yy
+    response = moment_xx * moment_yy - moment_xy.square() - k * trace.square()
+    positive_peak = response.max()
+    if positive_peak <= 0:
+        return []
+    return _corner_peaks(response, nmsSize, positive_peak * thresh)
 
 
-def compute_multiscale_sift_descriptor(Ix:torch.Tensor, Iy:torch.Tensor, kp_list: list, num_levels = 6):
-    """
-    计算 Harris 角点的 SIFT 特征描述子
-    
-    Args:
-        Ix (Tensor): x 方向的梯度张量
-        Iy (Tensor): y 方向的梯度张量
-        kp_list (list): 每个元素为 (x, y, level) 的角点列表
-        
-    Returns:
-        descriptors: 包含每个角点 SIFT 描述子的列表，形状为 [num_kp, 128]
-    """
-    # 定义参数
-    bin_size = 4      # 每个方向直方图的小块大小
-    hist_bins = 8     # 方向直方图的 bins 数量
-    descriptor_size = 16*8  # 最终描述子长度
-    
-    # 将角点列表转换为张量
-    kps = torch.tensor(kp_list, dtype=torch.float32)
+def TomasiCorner(Ix: torch.Tensor, Iy: torch.Tensor, index=1000,
+                 size=5, sigma=2, nmsSize=11):
+    """Return up to index strongest (row, column) Shi-Tomasi corners."""
+    if index < 0:
+        raise ValueError("index must be non-negative")
+    grad_x, grad_y = _gradients(Ix, Iy)
+    moment_xx, moment_yy, moment_xy = _second_moments(grad_x, grad_y, size, sigma)
+    discriminant = (moment_xx - moment_yy).square() + 4 * moment_xy.square()
+    response = (moment_xx + moment_yy - torch.sqrt(discriminant.clamp_min(0))) / 2
+    return _corner_peaks(response, nmsSize, maximum=index)
 
-    grad_angle_list = []
-    grad_magnitude_list = []
 
-    current_shape = Ix.shape
+def _histogram_descriptor(magnitudes, angles, cells_per_axis, orientation_bins, angle_range):
+    patch_size = magnitudes.shape[0]
+    cell_size = patch_size // cells_per_axis
+    cell_rows = torch.arange(patch_size, device=magnitudes.device) // cell_size
+    cell_columns = torch.arange(patch_size, device=magnitudes.device) // cell_size
+    cell_indices = (cell_rows[:, None] * cells_per_axis + cell_columns[None, :]) * orientation_bins
 
-    Ix_ = Ix.clone()
-    Iy_ = Iy.clone()
-    
-    for i in range(num_levels):
-        # 计算梯度方向和幅度
-        grad_angle = torch.atan2(Iy, Ix)  # 归一化到 [-pi, pi]
-        grad_magnitude = torch.sqrt(Ix**2 + Iy**2)
-        
-        grad_angle_list.append(grad_angle)
-        grad_magnitude_list.append(grad_magnitude)
+    bin_positions = torch.remainder(angles, angle_range) * (orientation_bins / angle_range)
+    lower_bins = torch.floor(bin_positions).long() % orientation_bins
+    upper_bins = (lower_bins + 1) % orientation_bins
+    upper_weights = bin_positions - torch.floor(bin_positions)
 
-        if current_shape[0] > 1 or current_shape[1] > 1:
-            # Use the 'valid' option to prevent zero-padding
-            Ix_= F.interpolate(Ix_.unsqueeze(0).unsqueeze(0), 
-                               size=(current_shape[1] // 2, current_shape[0] // 2), mode='bilinear').squeeze(0).squeeze(0)
-            Iy_ = F.interpolate(Iy_.unsqueeze(0).unsqueeze(0), 
-                               size=(current_shape[1] // 2, current_shape[0] // 2), mode='bilinear').squeeze(0).squeeze(0)
-            current_shape = Ix.shape
-    
+    descriptor = torch.zeros(cells_per_axis * cells_per_axis * orientation_bins,
+                             device=magnitudes.device, dtype=magnitudes.dtype)
+    descriptor.scatter_add_(0, (cell_indices + lower_bins).flatten(),
+                            (magnitudes * (1 - upper_weights)).flatten())
+    descriptor.scatter_add_(0, (cell_indices + upper_bins).flatten(),
+                            (magnitudes * upper_weights).flatten())
+    descriptor = F.normalize(descriptor, dim=0, eps=1e-8)
+    descriptor = descriptor.clamp(max=0.2)
+    return F.normalize(descriptor, dim=0, eps=1e-8)
+
+
+def hog(Ix: torch.Tensor, Iy: torch.Tensor, kplist: list):
+    """Return valid (x, y) points and 36-dimensional local HOG descriptors."""
+    grad_x, grad_y = _gradients(Ix, Iy)
+    magnitudes = torch.hypot(grad_x, grad_y)
+    angles = torch.atan2(grad_y, grad_x)
+    valid_points = []
     descriptors = []
-    kplist = []
+    height, width = grad_x.shape
+    for point in kplist:
+        column, row = (int(round(float(coordinate))) for coordinate in point[:2])
+        if row < 8 or column < 8 or row + 8 > height or column + 8 > width:
+            continue
+        patch_magnitudes = magnitudes[row - 8:row + 8, column - 8:column + 8]
+        patch_angles = angles[row - 8:row + 8, column - 8:column + 8]
+        descriptors.append(_histogram_descriptor(patch_magnitudes, patch_angles, 2, 9, math.pi))
+        valid_points.append((column, row))
+    return valid_points, descriptors
 
-    for i, (x, y, level) in enumerate(kp_list):
 
-        # 提取周围区域的梯度信息
-        grad_angle = grad_angle_list[level-1]
-        grad_magnitude = grad_magnitude_list[level-1]
-        
-        region_angle = grad_angle[y - bin_size//2 : y + bin_size//2,
-                                  x - bin_size//2 : x + bin_size//2]
-        region_magnitude = grad_magnitude[y - bin_size//2 : y + bin_size//2,
-                                          x - bin_size//2 : x + bin_size//2]
-        # 转换到整数坐标
-        x = int(round(x))
-        y = int(round(y))
-        
-        # 检查边界条件
-        if x < bin_size or y < bin_size or \
-           x + bin_size > grad_angle.size(1) or y + bin_size > grad_angle.size(0):
-            continue  # 跳过边缘点
-            
-        # 创建方向直方图
-        hist = torch.zeros(hist_bins, device=Ix.device)
-        cell_size = bin_size // 2
-        
-        for dy in range(cell_size):
-            for dx in range(cell_size):
-                # 计算每个小块的梯度方向和幅度
-                angles = region_angle[dy*cell_size : (dy+1)*cell_size,
-                                     dx*cell_size : (dx+1)*cell_size]
-                magnitudes = region_magnitude[dy*cell_size : (dy+1)*cell_size,
-                                            dx*cell_size : (dx+1)*cell_size]
-                
-                # 将角度归一化为 0-360 度
-                angles = torch.fmod(angles + math.pi, 2*math.pi) * (180/math.pi)
-                
-                # 统计每个方向的幅度贡献
-                for a, m in zip(angles.flatten(), magnitudes.flatten()):
-                    bin_idx = int((a % 360) // (360/hist_bins))
-                    hist[bin_idx] += m
-                    
-        # 归一化直方图
-        if torch.sum(hist) > 1e-8:
-            hist /= torch.sum(hist)
-            
-        # 将直方图扩展为 128 维描述子
-        descriptor = []
-        for i in range(4):
-            for j in range(4):
-                start_idx = (i*hist_bins//4 + j) % hist_bins
-                end_idx = (start_idx + hist_bins//4) % hist_bins
-                if start_idx < end_idx:
-                    descriptor += hist[start_idx:end_idx].tolist()
-                else:
-                    descriptor += torch.cat([hist[start_idx:], hist[:end_idx]]).tolist()
-                    
-        # 归一化描述子
-        descriptor = torch.tensor(descriptor)
-        descriptor /= torch.norm(descriptor) + 1e-8
-        if torch.max(descriptor) > 0.2:
-            descriptor *= (0.2 / torch.max(descriptor))
-            
-        descriptors.append(descriptor)
-        kplist.append([x*2**(level-1),y*2**(level-1)])
-    
-    return descriptors,kplist
+def _gradient_pyramid(grad_x, grad_y, num_levels):
+    for level in range(num_levels):
+        yield grad_x, grad_y
+        height, width = grad_x.shape
+        if min(height, width) < 32:
+            break
+        next_shape = (height // 2, width // 2)
+        grad_x = F.interpolate(grad_x[None, None], size=next_shape,
+                               mode="bilinear", align_corners=False)[0, 0]
+        grad_y = F.interpolate(grad_y[None, None], size=next_shape,
+                               mode="bilinear", align_corners=False)[0, 0]
 
+
+def steadyHarrisCornerForSIFT(Ix: torch.Tensor, Iy: torch.Tensor, num_levels=6,
+                             thresh=0.1, k=0.1, size=5, sigma=1, nmsSize=11):
+    """Return (x, y, one-based level) corners supported at adjacent scales."""
+    if num_levels < 1:
+        raise ValueError("num_levels must be positive")
+    grad_x, grad_y = _gradients(Ix, Iy)
+    levels = list(_gradient_pyramid(grad_x, grad_y, num_levels))
+    points_by_level = []
+    for level_x, level_y in levels:
+        corners = HarrisCorner(level_x, level_y, thresh=thresh, k=k,
+                               size=size, sigma=sigma, nmsSize=nmsSize)
+        points_by_level.append(np.asarray([(column, row) for row, column in corners],
+                                          dtype=np.float32).reshape(-1, 2))
+
+    stable_points = []
+    for level_index, points in enumerate(points_by_level):
+        if len(points) == 0:
+            continue
+        if len(points_by_level) == 1:
+            supported = np.ones(len(points), dtype=bool)
+        else:
+            supported = np.zeros(len(points), dtype=bool)
+            original_points = points * (2 ** level_index)
+            for neighbor_index in (level_index - 1, level_index + 1):
+                if neighbor_index < 0 or neighbor_index >= len(points_by_level):
+                    continue
+                neighbor_points = points_by_level[neighbor_index]
+                if len(neighbor_points) == 0:
+                    continue
+                neighbor_tree = cKDTree(neighbor_points * (2 ** neighbor_index))
+                radius = 2 * (2 ** max(level_index, neighbor_index))
+                distances, _ = neighbor_tree.query(original_points, distance_upper_bound=radius)
+                supported |= np.isfinite(distances)
+        for column, row in points[supported]:
+            stable_points.append((int(column), int(row), level_index + 1))
+    return stable_points
+
+
+def compute_multiscale_sift_descriptor(Ix: torch.Tensor, Iy: torch.Tensor,
+                                       kp_list: list, num_levels=6):
+    """Return 128-dimensional SIFT-style descriptors and original-scale (x, y) points."""
+    if num_levels < 1:
+        raise ValueError("num_levels must be positive")
+    grad_x, grad_y = _gradients(Ix, Iy)
+    pyramid = list(_gradient_pyramid(grad_x, grad_y, num_levels))
+    gradient_maps = [(torch.hypot(level_x, level_y), torch.atan2(level_y, level_x))
+                     for level_x, level_y in pyramid]
+
+    coordinates = torch.arange(-8, 8, device=grad_x.device, dtype=grad_x.dtype) + 0.5
+    grid_y, grid_x = torch.meshgrid(coordinates, coordinates, indexing="ij")
+    gaussian_weights = torch.exp(-(grid_x.square() + grid_y.square()) / (2 * 8 ** 2))
+
+    descriptors = []
+    valid_points = []
+    for column, row, level in kp_list:
+        level_index = int(level) - 1
+        if level_index < 0 or level_index >= len(gradient_maps):
+            continue
+        column = int(round(float(column)))
+        row = int(round(float(row)))
+        magnitudes, angles = gradient_maps[level_index]
+        height, width = magnitudes.shape
+        if row < 8 or column < 8 or row + 8 > height or column + 8 > width:
+            continue
+        patch_magnitudes = magnitudes[row - 8:row + 8, column - 8:column + 8] * gaussian_weights
+        patch_angles = angles[row - 8:row + 8, column - 8:column + 8]
+        orientation_histogram = torch.zeros(36, device=grad_x.device, dtype=grad_x.dtype)
+        orientation_indices = torch.floor(torch.remainder(patch_angles, 2 * math.pi)
+                                          * (36 / (2 * math.pi))).long() % 36
+        orientation_histogram.scatter_add_(0, orientation_indices.flatten(),
+                                           patch_magnitudes.flatten())
+        dominant_bin = torch.argmax(orientation_histogram)
+        dominant_angle = (dominant_bin + 0.5) * (2 * math.pi / 36)
+        relative_angles = patch_angles - dominant_angle
+        descriptors.append(_histogram_descriptor(patch_magnitudes, relative_angles,
+                                                  4, 8, 2 * math.pi))
+        scale = 2 ** level_index
+        valid_points.append((column * scale, row * scale))
+    return descriptors, valid_points

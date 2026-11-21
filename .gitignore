@@ -71,3 +71,4 @@ build
 dist
 __pycache__
 .ipynb_checkpoints
+codex_tmp/

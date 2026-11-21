@@ -2,6 +2,7 @@
 
 from .basic import batch_inference
 
+from .sd_poisson import sd_gradients, poisson_gray, sd_gray_preview
 from .fusion import laplacian_blending,laplacian_blending_1c_batch,poisson_blending,poisson_blending_solve_eq
 
 from .integration import TD_integration,SD_integration

@@ -12,7 +12,7 @@ except:
 
 #用于重建
 #用于rgb的ISP
-from tianmoucv.proc.reconstruct import poisson_blending
+from tianmoucv.proc.reconstruct import poisson_blending, sd_gradients
 from tianmoucv.isp import default_rgb_isp,SD2XY,upsampleTSD_conv,ACESToneMapping,upsample_cross_conv
 from ctypes import *
 flag = True
@@ -511,17 +511,11 @@ class TianmoucDataReader_basic():
         
         return sample
     
-    def HDRRecon(self,SD,F0):
-        '''
-        HDR fusion
-        '''
-        F0 = torch.Tensor(F0)
-        Ix,Iy= SD2XY(SD)#0-1
-        Ix = F.interpolate(torch.Tensor(Ix).unsqueeze(0).unsqueeze(0), size=(320,640), mode='bilinear').squeeze(0).squeeze(0)
-        Iy = F.interpolate(torch.Tensor(Iy).unsqueeze(0).unsqueeze(0), size=(320,640), mode='bilinear').squeeze(0).squeeze(0)
-        blend_hdr = poisson_blending(Ix,Iy, srcimg=F0, iteration=20, mask_rgb=True, mask_th = 32)
-        return blend_hdr
-    
+    def HDRRecon(self, SD, F0):
+        """Fuse normalized native-grid SD with its corresponding COP frame."""
+        gx, gy = sd_gradients(SD)
+        return poisson_blending(gx, gy, srcimg=F0, mask_rgb=True, mask_th=32)
+
     def preprocess(self,F0_raw,F1_raw,tsdiff):
         '''
         use isp in TIANMOUCV

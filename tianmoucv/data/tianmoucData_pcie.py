@@ -30,7 +30,7 @@ except:
     
 #用于色彩调整
 from tianmoucv.isp import SD2XY,default_rgb_isp
-from tianmoucv.proc.reconstruct import laplacian_blending
+from tianmoucv.proc.reconstruct import poisson_blending, sd_gradients
 
 adc_bit_prec = 8
 width = 160
@@ -518,14 +518,11 @@ class TianmoucDataReader_pcie():
         sample['labels'] = legalSample['labels']
         return sample
     
-    def HDRRecon(self,SD,F0):
-        F0 = torch.Tensor(F0)
-        Ix,Iy= SD2XY(SD)
-        Ix = F.interpolate(torch.Tensor(Ix).unsqueeze(0).unsqueeze(0), size=(320,640), mode='bilinear').squeeze(0).squeeze(0)
-        Iy = F.interpolate(torch.Tensor(Iy).unsqueeze(0).unsqueeze(0), size=(320,640), mode='bilinear').squeeze(0).squeeze(0)
-        blend_hdr = laplacian_blending(-Ix,-Iy, srcimg=F0,iteration=20, mask_rgb=True)
-        return blend_hdr
-        
+    def HDRRecon(self, SD, F0):
+        """Fuse normalized native-grid SD with its corresponding COP frame."""
+        gx, gy = sd_gradients(SD)
+        return poisson_blending(gx, gy, srcimg=F0, mask_rgb=True, mask_th=24)
+
     def locateSample(self,index):
         relativeIndex = index
         for key in self.sampleNumDict:

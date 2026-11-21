@@ -6,12 +6,9 @@ import time
 
 import cv2
 import torch
-import torch.nn.functional as F
 
-#用于色彩调整
-from tianmoucv.isp import SD2XY,ACESToneMapping
 #算法
-from tianmoucv.proc.reconstruct import laplacian_blending
+from tianmoucv.proc.reconstruct import sd_gradients, poisson_blending, sd_gray_preview
 #start camera and read
 from tianmoucv.camera.sdk_utils import TMstreamingDataReader
 from tianmoucv.camera.sdk_utils import global_aop_queue,global_cop_queue,result_queue
@@ -44,25 +41,22 @@ def AOP_thread():
             rawtsdiff[abs(rawtsdiff)<3] = 0
             #result_queue.put(('aop',showimg/32.0))
             #gray recon
-            SD = torch.Tensor(np.stack([sdl,sdr],axis=-1))
-            Ix,Iy= SD2XY(SD)
-            gray = laplacian_blending(-Ix,-Iy,iteration=10).numpy()
-            gray = (gray-np.min(gray))/(np.max(gray)-np.min(gray))
-            gray_3 = np.stack([gray]*3,axis=-1)
-
-            gray_int8 = (gray*255).astype(np.uint8)
+            gx, gy = sd_gradients(np.stack((sdl, sdr)))
+            gray_int8 = sd_gray_preview(poisson_blending(gx, gy))
+            gray_3 = np.repeat(gray_int8[..., None], 3, axis=-1) / 255.0
             qr_codes = pyzbar.decode(gray_int8)
 
             imshow_core = np.concatenate([rawtsdiff/128.0,gray_3],axis=1)
             imshow = np.zeros([320,640,3])
-            biash, biasw = (80,160)
-            imshow[biash:biash+160,biasw:biasw+320,:] = imshow_core
+            height, width = imshow_core.shape[:2]
+            biash, biasw = (320-height)//2, (640-width)//2
+            imshow[biash:biash+height,biasw:biasw+width,:] = imshow_core
             imshow = (imshow*255).astype(np.uint8)
             
 
             for qr_code in qr_codes:
                 (x, y, w, h) = qr_code.rect
-                x += biasw + 160
+                x += biasw + rawtsdiff.shape[1]
                 y += biash
                 cv2.rectangle(imshow, (x, y), (x + w, y + h), (0, 0, 255), 2)
                 qr_code_data = qr_code.data.decode("utf-8")
@@ -84,12 +78,9 @@ def COP_thread():
             if not rawdata_rod is None:
                 rgb = rawdata.astype(np.float32)
                 td,sdl,sdr = rawdata_rod
-                SD = torch.Tensor(np.stack([sdl,sdr],axis=-1))
-                Ix,Iy= SD2XY(SD)
-                Ix = F.interpolate(torch.Tensor(Ix).unsqueeze(0).unsqueeze(0), size=(320,640), mode='bilinear').squeeze(0).squeeze(0)
-                Iy = F.interpolate(torch.Tensor(Iy).unsqueeze(0).unsqueeze(0), size=(320,640), mode='bilinear').squeeze(0).squeeze(0)
-                blend_hdr = laplacian_blending(-Ix,-Iy, srcimg= torch.Tensor(rgb),iteration=10, mask_rgb=True)
-                blend_hdr = blend_hdr.numpy()
+                gx, gy = sd_gradients(np.stack((sdl, sdr)).astype(np.float32) / 128)
+                blend_hdr = poisson_blending(gx, gy, srcimg=rgb / 255.0, mask_rgb=True)
+                blend_hdr = blend_hdr.numpy() * 255.0
                 imshow = np.concatenate([rgb,blend_hdr],axis=0) 
                 imshow[imshow>255]=255
                 imshow[imshow<0]=0
