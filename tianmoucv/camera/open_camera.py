@@ -14,12 +14,9 @@ from tianmoucv.camera.sdk_utils import TMstreamingDataReader, put_latest
 def torch_camera_ops():
     """Import the optional reconstruction stack when it is selected."""
     import torch
-    import torch.nn.functional as functional
+    from tianmoucv.proc.reconstruct import sd_gradients, poisson_blending, sd_gray_preview
 
-    from tianmoucv.isp import SD2XY
-    from tianmoucv.proc.reconstruct import poisson_blending
-
-    return torch, functional, SD2XY, poisson_blending
+    return torch, sd_gradients, poisson_blending, sd_gray_preview
 
 
 def to_tensor(array, torch):
@@ -43,43 +40,24 @@ def raw_rod_preview(rawdata, scale=8):
 
 
 def process_aop(input_queue, output_queue, iterations):
-    torch, _, SD2XY, poisson_blending = torch_camera_ops()
+    torch, sd_gradients, poisson_blending, preview = torch_camera_ops()
     while True:
         sdl, sdr = input_queue.get()
         with torch.inference_mode():
-            sd = to_tensor(np.stack((sdl, sdr), axis=-1), torch).float()
-            ix, iy = SD2XY(sd)
-            gray = to_numpy(poisson_blending(-ix, -iy, iteration=iterations))
-
-        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-        put_latest(output_queue, gray.astype(np.uint8))
+            gx, gy = sd_gradients(to_tensor(np.stack((sdl, sdr)), torch))
+            gray = preview(poisson_blending(gx, gy))
+        put_latest(output_queue, gray)
 
 
 def process_cop(input_queue, output_queue, iterations):
-    torch, functional, SD2XY, poisson_blending = torch_camera_ops()
+    torch, sd_gradients, poisson_blending, _ = torch_camera_ops()
     while True:
         rgb, rod = input_queue.get()
         _, sdl, sdr = rod
-
         with torch.inference_mode():
-            sd = to_tensor(np.stack((sdl, sdr), axis=-1), torch).float()
-            ix, iy = SD2XY(sd)
-            ix = functional.interpolate(
-                ix[None, None], size=(320, 640), mode="bilinear",
-                align_corners=False,
-            )[0, 0]
-            iy = functional.interpolate(
-                iy[None, None], size=(320, 640), mode="bilinear",
-                align_corners=False,
-            )[0, 0]
-            hdr = poisson_blending(
-                -ix / 255.0,
-                -iy / 255.0,
-                srcimg=to_tensor(rgb, torch).div(255.0),
-                iteration=iterations,
-                mask_rgb=True,
-                mask_th=24,
-            )
+            gx, gy = sd_gradients(to_tensor(np.stack((sdl, sdr)), torch).float() / 128)
+            hdr = poisson_blending(gx, gy, srcimg=to_tensor(rgb, torch).div(255.0),
+                                   mask_rgb=True, mask_th=24)
 
         hdr = np.clip(to_numpy(hdr) * 255.0, 0, 255).astype(np.uint8)
         put_latest(output_queue, cv2.cvtColor(hdr, cv2.COLOR_RGB2BGR))
@@ -108,7 +86,7 @@ def parse_args():
     )
     parser.add_argument("--aop-fps", type=float, default=20.0)
     parser.add_argument("--cop-fps", type=float, default=30.0)
-    parser.add_argument("--iterations", type=int, default=5)
+    parser.add_argument("--iterations", type=int, default=5, help="compatibility option; Poisson now uses a direct solver")
     parser.add_argument("--threads", type=int, default=2)
     return parser.parse_args()
 
