@@ -1,3 +1,6 @@
-python -m pip uninstall tianmoucv | echo "y" 
-python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-ONLY_UPDATE_PYTHON=1 python -m pip install --no-deps . --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")"
+
+python -m pip install 'setuptools>=64' wheel 'pybind11>=2.12' -r requirements.txt
+ONLY_UPDATE_PYTHON=1 python -m pip install --no-build-isolation --no-deps --no-cache-dir .

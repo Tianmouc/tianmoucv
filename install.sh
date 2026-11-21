@@ -1,17 +1,9 @@
-#conda install pip
-python -m pip install pybind11 -i https://pypi.tuna.tsinghua.edu.cn/simple
-echo "compile rdp_pcie lib..."
-cd tianmoucv/rdp_pcie/
-sh compile_pybind.sh
-cd ../..
-echo "compile rdp_usb lib..."
-cd tianmoucv/rdp_usb/
-sh compile_pybind.sh
-cd ../..
-echo "compile sdk lib..."
-cd tianmoucv/camera
-sh compile.sh
-cd ../..
-echo "install requirements..."
-python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-python -m pip install --no-deps . -i https://pypi.tuna.tsinghua.edu.cn/simple
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")"
+
+python -m pip install 'setuptools>=64' wheel 'pybind11>=2.12' -r requirements.txt
+if ! (cd tianmoucv/camera && sh compile.sh); then
+    echo "Optional camera SDK build failed; continuing with the Python package." >&2
+fi
+python -m pip install --no-build-isolation --no-deps .
