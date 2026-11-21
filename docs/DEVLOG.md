@@ -92,3 +92,11 @@
 - 去模糊接口增加曝光信息读取：使用正则兼容 `us`、`µs`、`ms` 等记录形式，按照样本 `C_idx` 读取曝光时间并结合 AOP 自动估计 blur length。
 - 更新 denoise/deblur 示例 notebook；denoise 使用 `outdoor_cross_6`，deblur 默认使用带 HS 标签且曝光记录完整的 `shake6` 实拍序列，并直接从 TianMouCV 公开接口完成推理，视频输出复用 `tianmoucv.utils.save_video` 的现有 MP4 写法。
 - 保留 `DualRecurrentDenoiserPT`、`TianmoucDeblurNet` 和旧输入/输出键作为兼容入口；未增加 TianMouCV 之外的新依赖。
+
+## 0.4.3.1 log @26.11.21
+
+- 同步 `tianmoucv_dev` 的特征检测更新：Harris、Shi-Tomasi 角点检测使用张量化二阶矩与非极大值抑制；修正 HOG、多尺度 SIFT 描述子的方向、边界和坐标处理，避免修改调用方输入。
+- 同步传统 LK、Horn–Schunck 光流更新：统一有符号 TD 与 SD 网格的输入约定，修正窗口求解、多尺度尺寸及位移缩放。
+- 同步 `Feature_tracker_sd` 更新：使用前后向金字塔 LK 检查、周期补点和历史轨迹保留；描述子匹配使用唯一候选，并修正图像对齐的点坐标。
+- 同步光流与跟踪入门、SD 特征跟踪、HS 和 LK 光流示例，更新预处理、箭头、插帧及 RGB/COP 坐标下的光流显示。
+- 版本号更新为 `0.4.3.1`，Git 忽略规则增加 `codex_tmp/`；保留现有 PyPI 发布配置。
